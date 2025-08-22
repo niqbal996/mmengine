@@ -13,7 +13,7 @@ from mmengine.registry import LOOPS
 from mmengine.structures import BaseDataElement
 from mmengine.utils import is_list_of
 from .amp import autocast
-from .base_loop import BaseLoop
+from .base_loop import BaseLoop, ActiveBaseLoop
 from .utils import calc_dynamic_intervals
 
 
@@ -324,6 +324,197 @@ class IterBasedTrainLoop(BaseLoop):
         """Dynamically modify the ``val_interval``."""
         step = bisect.bisect(self.dynamic_milestones, (self._iter + 1))
         self.val_interval = self.dynamic_intervals[step - 1]
+        
+@LOOPS.register_module()
+class IterBasedActiveTrainLoop(ActiveBaseLoop):
+    """Loop for iter-based training.
+
+    Args:
+        runner (Runner): A reference of runner.
+        dataloader_source (Dataloader or dict): A dataloader object or a dict to
+            build a dataloader from source domain.
+        dataloader_target (Dataloader or dict): A dataloader object or a dict to
+            build a dataloader from target domain.
+        max_iters (int): Total training iterations.
+        val_begin (int): The iteration that begins validating.
+            Defaults to 1.
+        val_interval (int): Validation interval. Defaults to 1000.
+        dynamic_intervals (List[Tuple[int, int]], optional): The
+            first element in the tuple is a milestone and the second
+            element is a interval. The interval is used after the
+            corresponding milestone. Defaults to None.
+    """
+
+    def __init__(
+            self,
+            runner,
+            dataloader: Union[DataLoader, Dict],
+            max_iters: int,
+            val_begin: int = 1,
+            val_interval: int = 1000,
+            region_label_interval: int = 1000,
+            labelling_budget: float = 0.1, 
+            dynamic_intervals: Optional[List[Tuple[int, int]]] = None) -> None:
+        super().__init__(runner, dataloader)
+        self._max_iters = int(max_iters)
+        assert self._max_iters == max_iters, \
+            f'`max_iters` should be a integer number, but get {max_iters}'
+        self._max_epochs = 1  # for compatibility with EpochBasedTrainLoop
+        self._epoch = 0
+        self._iter = 0
+        self.val_begin = val_begin
+        self.val_interval = val_interval
+        self.region_label_interval = region_label_interval
+        self.active_round = 0
+        self.labelling_budget = labelling_budget
+        # This attribute will be updated by `EarlyStoppingHook`
+        # when it is enabled.
+        self.stop_training = False
+        if hasattr(self.dataloader_source.dataset, 'metainfo'):
+            self.runner.visualizer.dataset_meta = \
+                self.dataloader_source.dataset.metainfo
+        else:
+            print_log(
+                f'Dataset {self.dataloader_source.dataset.__class__.__name__} has no '
+                'metainfo. ``dataset_meta`` in visualizer will be '
+                'None.',
+                logger='current',
+                level=logging.WARNING)
+        if hasattr(self.dataloader_target.dataset, 'metainfo'):
+            self.runner.visualizer.dataset_meta = \
+                self.dataloader_target.dataset.metainfo
+        else:
+            print_log(
+                f'Dataset {self.dataloader_target.dataset.__class__.__name__} has no '
+                'metainfo. ``dataset_meta`` in visualizer will be '
+                'None.',
+                logger='current',
+                level=logging.WARNING)
+            
+        # get the iterator of the dataloader
+        self.source_dataloader_iterator = _InfiniteDataloaderIterator(self.dataloader_source)
+        self.target_dataloader_iterator = _InfiniteDataloaderIterator(self.dataloader_target)
+
+        self.dynamic_milestones, self.dynamic_intervals = \
+            calc_dynamic_intervals(
+                self.val_interval, dynamic_intervals)
+
+    @property
+    def max_epochs(self):
+        """int: Total epochs to train model."""
+        return self._max_epochs
+
+    @property
+    def max_iters(self):
+        """int: Total iterations to train model."""
+        return self._max_iters
+
+    @property
+    def epoch(self):
+        """int: Current epoch."""
+        return self._epoch
+
+    @property
+    def iter(self):
+        """int: Current iteration."""
+        return self._iter
+    
+    @property
+    def active_round(self):
+        """int: Current labelling round."""
+        return self.active_round
+    
+    @active_round.setter
+    def active_round(self, value):
+        self._active_round = value
+    
+    @property
+    def labelling_budget(self):
+        """float: Current labelling budget."""
+        return self.labelling_budget
+
+    @labelling_budget.setter
+    def labelling_budget(self, value):
+        self._labelling_budget = value
+
+    def run(self) -> None:
+        """Launch training."""
+        self.runner.call_hook('before_train')
+        self.runner.call_hook('before_train_epoch')
+        if self._iter > 0:
+            print_log(
+                f'Advance dataloader {self._iter} steps to skip data '
+                'that has already been trained',
+                logger='current',
+                level=logging.WARNING)
+            for _ in range(self._iter):
+                next(self.source_dataloader_iterator)
+                next(self.target_dataloader_iterator)
+        while self._iter < self._max_iters and not self.stop_training:
+            self.runner.model.train()
+            source_batch = next(self.source_dataloader_iterator)
+            # The target dataloader should return active labels with 255 for unlabelled regions
+            target_batch = next(self.target_dataloader_iterator)
+            self.run_iter(source_batch, target_batch)
+
+            self._decide_current_val_interval()
+            if (self.runner.val_loop is not None
+                    and self._iter >= self.val_begin
+                    and (self._iter % self.val_interval == 0
+                         or self._iter == self._max_iters)):
+                self.runner.val_loop.run()
+            # Check if it's time for region-based labeling
+            # After this hook is done, there should be self.labelling_budget
+            # percentage of pixels labeled in the dataset and saved onto hard
+            # disk. Model should load them with new labels and self.target_dataloader_iterator
+            # should give the updated labels instead. 
+            if (self._iter + 1) % self.region_label_interval == 0:
+                # Call your region-based labeling hook/function here
+                self.runner.call_hook('after_region_label')
+            self._iter += 1
+
+        self.runner.call_hook('after_train_epoch')
+        self.runner.call_hook('after_train')
+        return self.runner.model
+
+    def run_iter(self, source_batch: Sequence[dict], target_batch: Sequence[dict]) -> None:
+        """Iterate one mini-batch.
+
+        Args:
+            source_batch (Sequence[dict]): Batch of data from source dataloader.
+            target_batch (Sequence[dict]): Batch of data from target dataloader.
+        """
+        self.runner.call_hook(
+            'before_train_iter', batch_idx=self._iter, data_batch=source_batch)
+        # Enable gradient accumulation mode and avoid unnecessary gradient
+        # synchronization during gradient accumulation process.
+        # outputs should be a dict of loss.
+        outputs_source = self.runner.model.train_step(
+            source_batch, optim_wrapper=self.runner.optim_wrapper)
+
+        outputs_target = self.runner.model.train_step(
+            target_batch, optim_wrapper=self.runner.optim_wrapper)
+        self._decide_current_val_interval()
+        if (self.runner.val_loop is not None
+                    and self._iter >= self.val_begin
+                    and (self._iter % self.val_interval == 0
+                         or self._iter == self._max_iters)):
+            self.runner.val_loop.run()
+        # Call hook with both batches and outputs
+        outputs = {f'source_{k}': v for k, v in outputs_source.items()}
+        outputs.update({f'target_{k}': v for k, v in outputs_target.items()})
+        self.runner.call_hook(
+            'after_train_iter',
+            batch_idx=self._iter,
+            data_batch={'source': source_batch, 'target': target_batch},
+            outputs=outputs,
+        )
+        self._iter += 1
+
+    def _decide_current_val_interval(self) -> None:
+        """Dynamically modify the ``val_interval``."""
+        step = bisect.bisect(self.dynamic_milestones, (self._iter + 1))
+        self.val_interval = self.dynamic_intervals[step - 1]
 
 
 @LOOPS.register_module()
@@ -411,7 +602,7 @@ class ValLoop(BaseLoop):
             batch_idx=idx,
             data_batch=data_batch,
             outputs=outputs)
-
+    
 
 @LOOPS.register_module()
 class TestLoop(BaseLoop):
@@ -494,7 +685,7 @@ class TestLoop(BaseLoop):
             batch_idx=idx,
             data_batch=data_batch,
             outputs=outputs)
-
+    
 
 def _parse_losses(losses: Dict[str, HistoryBuffer],
                   stage: str) -> Dict[str, float]:
