@@ -353,7 +353,6 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
             val_begin: int = 1,
             val_interval: int = 1000,
             region_label_interval: int = 1000,
-            labelling_budget: float = 0.1, 
             dynamic_intervals: Optional[List[Tuple[int, int]]] = None) -> None:
         super().__init__(runner, dataloader)
         self._max_iters = int(max_iters)
@@ -365,8 +364,8 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
         self.val_begin = val_begin
         self.val_interval = val_interval
         self.region_label_interval = region_label_interval
-        self.active_round = 0
-        self.labelling_budget = labelling_budget
+        self.active_round = 0   # labelling round starting from 0 no labels only source domain.
+        self.label_budget = 0.0 # label budget between 0-1
         # This attribute will be updated by `EarlyStoppingHook`
         # when it is enabled.
         self.stop_training = False
@@ -419,23 +418,23 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
         """int: Current iteration."""
         return self._iter
     
-    @property
-    def active_round(self):
-        """int: Current labelling round."""
-        return self.active_round
+    # @property
+    # def active_round(self):
+    #     """int: Current labelling round."""
+    #     return self.active_round
     
-    @active_round.setter
-    def active_round(self, value):
-        self._active_round = value
+    # @active_round.setter
+    # def active_round(self, value):
+    #     self._active_round = value
     
-    @property
-    def labelling_budget(self):
-        """float: Current labelling budget."""
-        return self.labelling_budget
+    # @property
+    # def labelling_budget(self):
+    #     """float: Current labelling budget."""
+    #     return self.labelling_budget
 
-    @labelling_budget.setter
-    def labelling_budget(self, value):
-        self._labelling_budget = value
+    # @labelling_budget.setter
+    # def labelling_budget(self, value):
+    #     self._labelling_budget = value
 
     def run(self) -> None:
         """Launch training."""
@@ -489,11 +488,10 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
         # Enable gradient accumulation mode and avoid unnecessary gradient
         # synchronization during gradient accumulation process.
         # outputs should be a dict of loss.
-        outputs_source = self.runner.model.train_step(
-            source_batch, optim_wrapper=self.runner.optim_wrapper)
-
-        outputs_target = self.runner.model.train_step(
-            target_batch, optim_wrapper=self.runner.optim_wrapper)
+        # target_batch['data_samples'][0]._gt_sem_seg.data.fill_(255)
+        outputs = self.runner.model.train_step_ada(
+            [source_batch, target_batch], optim_wrapper=self.runner.optim_wrapper)
+        
         self._decide_current_val_interval()
         if (self.runner.val_loop is not None
                     and self._iter >= self.val_begin
@@ -501,8 +499,6 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
                          or self._iter == self._max_iters)):
             self.runner.val_loop.run()
         # Call hook with both batches and outputs
-        outputs = {f'source_{k}': v for k, v in outputs_source.items()}
-        outputs.update({f'target_{k}': v for k, v in outputs_target.items()})
         self.runner.call_hook(
             'after_train_iter',
             batch_idx=self._iter,
@@ -515,7 +511,7 @@ class IterBasedActiveTrainLoop(ActiveBaseLoop):
         """Dynamically modify the ``val_interval``."""
         step = bisect.bisect(self.dynamic_milestones, (self._iter + 1))
         self.val_interval = self.dynamic_intervals[step - 1]
-
+    
 
 @LOOPS.register_module()
 class ValLoop(BaseLoop):

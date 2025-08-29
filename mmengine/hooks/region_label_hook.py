@@ -1,23 +1,31 @@
 import os
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import numpy as np
+from matplotlib.colors import ListedColormap, BoundaryNorm
 from PIL import Image
+from tqdm import tqdm
+from torch.utils.data import DataLoader
 from mmengine.hooks import Hook
 from mmengine.registry import HOOKS
+from mmengine.logging import print_log
 
 @HOOKS.register_module()
 class RegionLabelHook(Hook):
-    def __init__(self, label_budget=5, region_size=11, selection_mode='ratio', uncertainty_threshold=None):
-        self.label_budget = label_budget  # e.g. 5 for 5%
+    def __init__(self, label_budget_per_round=0.1, region_size=11, selection_mode='ratio', uncertainty_threshold=None):
+        self.label_budget_per_round = label_budget_per_round  # e.g. 5 for 5%
         self.region_size = region_size
         self.selection_mode = selection_mode  # 'ratio' or 'threshold'
         self.uncertainty_threshold = uncertainty_threshold
+        
+        # Initialize environment variables for active learning state
+        # os.environ.setdefault('ACTIVE_ROUND', '0')
+        # os.environ.setdefault('LABEL_BUDGET', '0.0')
+        # os.environ.setdefault('CURRENT_LABEL_DIR', '')
+        # print(f"[RegionLabelHook] Initialized environment variables: ACTIVE_ROUND={os.environ['ACTIVE_ROUND']}, LABEL_BUDGET={os.environ['LABEL_BUDGET']}")
 
     def visualize_active_mask(self, active_mask, mask_path, n_labels=None):
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import ListedColormap, BoundaryNorm
         plt.ion()  # Enable interactive mode
         img_name = os.path.basename(mask_path)
         unique_labels = torch.unique(active_mask)
@@ -98,30 +106,78 @@ class RegionLabelHook(Hook):
         model.eval()
         device = next(model.parameters()).device
         target_loader = getattr(runner.train_loop, 'target_dataloader_iterator', None)
+        custom_pipeline = runner.test_loop.dataloader.dataset.pipeline
         dataset = getattr(runner.train_loop, 'dataloader_target', None).dataset
         if target_loader is None:
             raise AttributeError("train_loop does not have a 'target_dataloader_iterator'.")
+        
+        # Update active learning state
+        runner.train_loop.active_round += 1
+        runner.train_loop.label_budget += self.label_budget_per_round
+        
         # Find the original label directory and create the new one
         orig_label_dir = dataset.data_prefix['seg_map_path']
-        new_label_dir = os.path.join(os.path.dirname(orig_label_dir), f'semantics_{self.label_budget}')
+        budget_int = int(runner.train_loop.label_budget * 100) if runner.train_loop.label_budget < 1.0 else int(runner.train_loop.label_budget)
+        new_label_dir = os.path.join(os.path.dirname(orig_label_dir), f'semantics_{budget_int}')
         os.makedirs(new_label_dir, exist_ok=True)
+        
+        print_log(f"Active learning round {runner.train_loop.active_round}, budget: {runner.train_loop.label_budget}", logger='current')
+        
+        # Write active learning state to a small file for cross-process sharing
+        state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
+        with open(state_path, 'w') as f:
+            f.write(f"{runner.train_loop.active_round}\n{runner.train_loop.label_budget}\n")
+        print_log(f"Wrote active state to {state_path}: round={runner.train_loop.active_round}, budget={runner.train_loop.label_budget}", logger='current')
 
-        region_ratio = self.label_budget / 100.0
-
-        for data in target_loader:
-            # img = data['inputs'][0].to(device).unsqueeze(0)
-            img_path = data['data_samples'][0].img_path
+        region_ratio = runner.train_loop.label_budget / 100.0
+        
+        # Create a temporary dataloader for processing all images once
+        # Use the original dataset without infinite sampling
+        temp_dataset = dataset
+        if hasattr(dataset, 'dataset'):  # If it's wrapped
+            temp_dataset = dataset.dataset
+            
+        # Simple iteration through dataset indices
+        processed_count = 0
+        file_count = len(temp_dataset)
+        print_log(f"Processing {file_count} files for active labeling from the target dataset", logger='current')
+        # Process each image in the dataset exactly once using dataset indexing
+        for idx in tqdm(range(min(file_count, len(temp_dataset)))):  # Limit for testing
+        # for idx in tqdm(range(min(file_count, 100))):  # Limit for testing
+            try:
+                # Get data by direct dataset access
+                data_info = temp_dataset.get_data_info(idx)
+                # Process the data through pipeline
+                # This compose pipeline does not need active labelling, just loading the data in correct format
+                # hence using the custom test loader pipeline without extra transforms.
+                data = custom_pipeline(data_info)
+                # Wrap in batch format for model inference
+                if isinstance(data, dict):
+                    # Create a simple batch structure
+                    data = {
+                        'inputs': [data.get('inputs', data.get('img'))],
+                        'data_samples': [data.get('data_samples')]
+                    }
+                
+                processed_count += 1
+            except Exception as e:
+                print_log(f"Error processing image {idx}: {e}", logger='current')
+                continue
+            # TODO this wont work with a multibatch scenario
             mask_path = data['data_samples'][0].seg_map_path
-            gt_mask = torch.tensor(np.array(Image.open(mask_path).convert('L')))
+            gt_mask = data['data_samples'][0]._gt_sem_seg.data[0]
+
             with torch.no_grad():
                 output = model.test_step(data)[0]
                 if hasattr(output, 'seg_logits'):
                     seg_logits = output.seg_logits.data
-                pred = output.pred_sem_seg.data
-                scores = torch.softmax(seg_logits, dim=0).max(dim=0)[0]  # uncertainty: 1 - max prob
+                # pred = output.pred_sem_seg.data
+                scores = torch.softmax(seg_logits, dim=0).max(dim=0)[0]
                 uncertainty = 1 - scores
 
             H, W = uncertainty.shape
+            # TODO there is no caching of active_mask from previous runs. Should the mask from previous run be taken or 
+            # should it be recalculated based on current uncertainties from the model.
             active_mask = torch.full((H, W), 255, dtype=torch.uint8)
             active = torch.zeros((H, W), dtype=torch.bool, device=device)
             selected = torch.zeros((H, W), dtype=torch.bool, device=device)
@@ -139,6 +195,6 @@ class RegionLabelHook(Hook):
             # Save the new mask
             img_name = os.path.basename(mask_path)
             save_path = os.path.join(new_label_dir, img_name)
-            # Visualization: show active_mask with unique color per label, grey for 255
-            self.visualize_active_mask(active_mask, mask_path)
             Image.fromarray(active_mask.numpy()).save(save_path)
+            
+        print_log(f"Finished processing {processed_count} files, saved to {new_label_dir}", logger='current')

@@ -116,6 +116,50 @@ class BaseModel(BaseModule):
         optim_wrapper.update_params(parsed_losses)
         return log_vars
 
+    def train_step_ada(self, data: Union[dict, tuple, list],
+                   optim_wrapper: OptimWrapper) -> Dict[str, torch.Tensor]:
+        """Implements the adaptive domain adaptation training process including
+        preprocessing for both source and target domain, 
+        model forward propagation, loss calculation from both domains,
+        optimization, and back-propagation.
+
+        During non-distributed training. If subclasses do not override the
+        :meth:`train_step`, :class:`EpochBasedTrainLoop` or
+        :class:`IterBasedTrainLoop` will call this method to update model
+        parameters. The default parameter update process is as follows:
+
+        1. Calls ``self.data_processor(data, training=False)`` to collect
+           batch_inputs and corresponding data_samples(labels).
+        2. Calls ``self(batch_inputs, data_samples, mode='loss')`` to get raw
+           loss
+        3. Calls ``self.parse_losses`` to get ``parsed_losses`` tensor used to
+           backward and dict of loss tensor used to log messages.
+        4. Calls ``optim_wrapper.update_params(loss)`` to update model.
+
+        Args:
+            data (dict or tuple or list): Data sampled from dataset.
+            optim_wrapper (OptimWrapper): OptimWrapper instance
+                used to update model parameters.
+
+        Returns:
+            Dict[str, torch.Tensor]: A ``dict`` of tensor for logging.
+        """
+        # Enable automatic mixed precision training context.
+        with optim_wrapper.optim_context(self):
+            source_data = self.data_preprocessor(data[0], True)
+            target_data = self.data_preprocessor(data[1], True)
+            source_supervised_loss = self._run_forward(source_data, mode='loss')  # type: ignore
+            target_active_loss = self._run_forward(target_data, mode='loss')
+            # type: ignore
+            # TODO add more losses here
+            losses = {}
+            # Add prefixes to keep both source and target losses
+            losses.update({f'source_{k}': v for k, v in source_supervised_loss.items()})
+            losses.update({f'target_{k}': v for k, v in target_active_loss.items()})
+        parsed_losses, log_vars = self.parse_losses(losses)  # type: ignore
+        optim_wrapper.update_params(parsed_losses)
+        return log_vars
+    
     def val_step(self, data: Union[tuple, dict, list]) -> list:
         """Gets the predictions of given data.
 
