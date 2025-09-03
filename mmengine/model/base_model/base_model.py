@@ -146,17 +146,15 @@ class BaseModel(BaseModule):
         """
         # Enable automatic mixed precision training context.
         with optim_wrapper.optim_context(self):
-            source_data = self.data_preprocessor(data[0], True)
-            target_data = self.data_preprocessor(data[1], True)
-            source_supervised_loss = self._run_forward(source_data, mode='loss')  # type: ignore
-            target_active_loss = self._run_forward(target_data, mode='loss')
-            # type: ignore
-            # TODO add more losses here
             losses = {}
-            # Add prefixes to keep both source and target losses
+            source_data = self.data_preprocessor(data[0], True)
+            source_supervised_loss = self._run_forward(source_data, mode='loss')
             losses.update({f'source_{k}': v for k, v in source_supervised_loss.items()})
-            losses.update({f'target_{k}': v for k, v in target_active_loss.items()})
-        parsed_losses, log_vars = self.parse_losses(losses)  # type: ignore
+            if torch.sum((data[1]['data_samples'][0]._gt_sem_seg.data != 255)) != 0:
+                target_data = self.data_preprocessor(data[1], True)
+                target_active_loss = self._run_forward(target_data, mode='loss')
+                losses.update({f'target_{k}': v for k, v in target_active_loss.items()})
+        parsed_losses, log_vars = self.parse_losses_ada(losses)  # type: ignore
         optim_wrapper.update_params(parsed_losses)
         return log_vars
     
@@ -220,6 +218,56 @@ class BaseModel(BaseModule):
         log_vars = OrderedDict(log_vars)  # type: ignore
 
         return loss, log_vars  # type: ignore
+    
+    def parse_losses_ada(
+        self, losses: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Parses the raw outputs (losses) of the network for domain adaptation.
+
+        Sums all losses with 'source_' and 'target_' in their keys separately,
+        and logs only the total source and total target loss.
+
+        Args:
+            losses (dict): Raw output of the network, which usually contain
+                losses and other necessary information.
+
+        Returns:
+            tuple[Tensor, dict]: The first is the total loss tensor (sum of all),
+            the second is log_vars with only total source and target loss.
+        """
+        source_total = 0.0
+        target_total = 0.0
+        negative_total = 0.0
+        local_consistency = 0.0
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                val = loss_value.mean()
+            elif is_list_of(loss_value, torch.Tensor):
+                val = sum(_loss.mean() for _loss in loss_value)
+            else:
+                raise TypeError(f'{loss_name} is not a tensor or list of tensors')
+            if loss_name.startswith('source_'):
+                source_total += val
+                if loss_name.endswith('_decode.loss_negative'):
+                    negative_total += val
+                if loss_name.endswith('_decode.loss_local_consistent'):
+                    local_consistency += val
+            elif loss_name.startswith('target_'):
+                target_total += val
+                if loss_name.endswith('_decode.loss_negative'):
+                    negative_total += val
+                if loss_name.endswith('_decode.loss_local_consistent'):
+                    local_consistency += val
+
+        total_loss = source_total + target_total
+        log_vars = OrderedDict([
+            ('loss', total_loss),
+            ('source_total_loss', source_total),
+            ('target_total_loss', target_total),
+            ('loss_negative', negative_total),
+            ('loss_local_consistent', local_consistency),
+        ])
+        return total_loss, log_vars
 
     def to(self, *args, **kwargs) -> nn.Module:
         """Overrides this method to call :meth:`BaseDataPreprocessor.to`

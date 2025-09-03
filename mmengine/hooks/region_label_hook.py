@@ -101,68 +101,60 @@ class RegionLabelHook(Hook):
                 break
         return active_mask
 
+    def init_masks(self, dataloader, mask_dir, indicator_dir):
+        # Initialize masks for the dataset
+        for data in tqdm(dataloader, total=len(dataloader), desc="Initializing active masks", unit='mask(s)'):
+            img_name = os.path.basename(data['data_samples'][0].img_path)
+            mask_path = os.path.join(mask_dir, img_name)
+            indicator_path = os.path.join(indicator_dir, img_name)[:-4]+'.pth'
+            h, w = data['data_samples'][0].img_shape
+            active_mask = np.ones((h, w), dtype=np.uint8) * 255
+            active_mask = Image.fromarray(active_mask)
+            active_mask.save(mask_path)
+            indicator = {
+                'active': torch.tensor([0], dtype=torch.bool),
+                'selected': torch.tensor([0], dtype=torch.bool),
+            }
+            torch.save(indicator, indicator_path)
+
     def after_region_label(self, runner):
         model = runner.model
         model.eval()
         device = next(model.parameters()).device
-        target_loader = getattr(runner.train_loop, 'target_dataloader_iterator', None)
-        custom_pipeline = runner.test_loop.dataloader.dataset.pipeline
-        dataset = getattr(runner.train_loop, 'dataloader_target', None).dataset
+        target_loader = getattr(runner.train_loop, 'dataloader_active', None)
+        # custom_pipeline = runner.test_loop.dataloader.dataset.pipeline
+        dataset = target_loader.dataset
         if target_loader is None:
             raise AttributeError("train_loop does not have a 'target_dataloader_iterator'.")
-        
-        # Update active learning state
-        runner.train_loop.active_round += 1
-        runner.train_loop.label_budget += self.label_budget_per_round
-        
         # Find the original label directory and create the new one
         orig_label_dir = dataset.data_prefix['seg_map_path']
         budget_int = int(runner.train_loop.label_budget * 100) if runner.train_loop.label_budget < 1.0 else int(runner.train_loop.label_budget)
-        new_label_dir = os.path.join(os.path.dirname(orig_label_dir), f'semantics_{budget_int}')
-        os.makedirs(new_label_dir, exist_ok=True)
-        
+        new_label_dir = os.path.join(os.path.dirname(orig_label_dir), 
+                                         runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_mask_path)
+        new_indicator_dir = os.path.join(os.path.dirname(orig_label_dir), 
+                                        runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_indicator_path)
+        state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
+        # if runner.train_loop.active_round == 0:
+        #     os.makedirs(new_label_dir, exist_ok=True)
+        #     os.makedirs(new_indicator_dir, exist_ok=True)
+        #     self.init_masks(target_loader, new_label_dir, new_indicator_dir)
+
+        # Update active learning state
+        runner.train_loop.active_round += 1
+        runner.train_loop.label_budget += self.label_budget_per_round
         print_log(f"Active learning round {runner.train_loop.active_round}, budget: {runner.train_loop.label_budget}", logger='current')
         
         # Write active learning state to a small file for cross-process sharing
-        state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
         with open(state_path, 'w') as f:
             f.write(f"{runner.train_loop.active_round}\n{runner.train_loop.label_budget}\n")
         print_log(f"Wrote active state to {state_path}: round={runner.train_loop.active_round}, budget={runner.train_loop.label_budget}", logger='current')
-
         region_ratio = runner.train_loop.label_budget / 100.0
-        
-        # Create a temporary dataloader for processing all images once
-        # Use the original dataset without infinite sampling
-        temp_dataset = dataset
-        if hasattr(dataset, 'dataset'):  # If it's wrapped
-            temp_dataset = dataset.dataset
-            
         # Simple iteration through dataset indices
         processed_count = 0
-        file_count = len(temp_dataset)
+        file_count = len(target_loader)
         print_log(f"Processing {file_count} files for active labeling from the target dataset", logger='current')
-        # Process each image in the dataset exactly once using dataset indexing
-        for idx in tqdm(range(min(file_count, len(temp_dataset)))):  # Limit for testing
+        for data in tqdm(target_loader, total=file_count, desc="Generating active masks", unit='image(s)'):  # Limit for testing
         # for idx in tqdm(range(min(file_count, 100))):  # Limit for testing
-            try:
-                # Get data by direct dataset access
-                data_info = temp_dataset.get_data_info(idx)
-                # Process the data through pipeline
-                # This compose pipeline does not need active labelling, just loading the data in correct format
-                # hence using the custom test loader pipeline without extra transforms.
-                data = custom_pipeline(data_info)
-                # Wrap in batch format for model inference
-                if isinstance(data, dict):
-                    # Create a simple batch structure
-                    data = {
-                        'inputs': [data.get('inputs', data.get('img'))],
-                        'data_samples': [data.get('data_samples')]
-                    }
-                
-                processed_count += 1
-            except Exception as e:
-                print_log(f"Error processing image {idx}: {e}", logger='current')
-                continue
             # TODO this wont work with a multibatch scenario
             mask_path = data['data_samples'][0].seg_map_path
             gt_mask = data['data_samples'][0]._gt_sem_seg.data[0]

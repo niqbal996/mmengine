@@ -46,6 +46,7 @@ class ActiveBaseLoop(BaseLoop):
         # Expect dataloader to be a dict with 'dataloader_source' and 'dataloader_target'
         dataloader_source = dataloader.get('dataloader_source')
         dataloader_target = dataloader.get('dataloader_target')
+        dataloader_active = dataloader.get('dataloader_active')
         # Optionally, pass one of them to BaseLoop for compatibility
         super().__init__(runner, dataloader_source)
         # Build both dataloaders
@@ -62,6 +63,13 @@ class ActiveBaseLoop(BaseLoop):
                 dataloader_target, seed=runner.seed, diff_rank_seed=diff_rank_seed)
         else:
             self.dataloader_target = dataloader_target
+
+        if isinstance(dataloader_active, dict):
+            diff_rank_seed = runner._randomness_cfg.get('diff_rank_seed', False)
+            self.dataloader_active = runner.build_dataloader(
+                dataloader_active, seed=runner.seed, diff_rank_seed=diff_rank_seed)
+        else:
+            self.dataloader_active = dataloader_active
 
     @property
     def runner(self):
