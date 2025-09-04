@@ -6,10 +6,12 @@ import matplotlib.colors as mcolors
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from PIL import Image
 from tqdm import tqdm
+import math
 from torch.utils.data import DataLoader
 from mmengine.hooks import Hook
 from mmengine.registry import HOOKS
 from mmengine.logging import print_log
+from .active_learning import FloatingRegionScore
 
 @HOOKS.register_module()
 class RegionLabelHook(Hook):
@@ -18,12 +20,12 @@ class RegionLabelHook(Hook):
         self.region_size = region_size
         self.selection_mode = selection_mode  # 'ratio' or 'threshold'
         self.uncertainty_threshold = uncertainty_threshold
-        
-        # Initialize environment variables for active learning state
-        # os.environ.setdefault('ACTIVE_ROUND', '0')
-        # os.environ.setdefault('LABEL_BUDGET', '0.0')
-        # os.environ.setdefault('CURRENT_LABEL_DIR', '')
-        # print(f"[RegionLabelHook] Initialized environment variables: ACTIVE_ROUND={os.environ['ACTIVE_ROUND']}, LABEL_BUDGET={os.environ['LABEL_BUDGET']}")
+        # TODO Update using the constructor arguments
+        self.active_radius = 1
+        self.mask_radius = self.active_radius * 2
+        self.region_scorer = FloatingRegionScore(in_channels=3, size=2*self.active_radius+1).cuda()
+        self.per_region_pixels = (2 * self.active_radius + 1) ** 2
+        self.active_ratio = 0.022 / 1000
 
     def visualize_active_mask(self, active_mask, mask_path, n_labels=None):
         plt.ion()  # Enable interactive mode
@@ -117,10 +119,44 @@ class RegionLabelHook(Hook):
             }
             torch.save(indicator, indicator_path)
 
+    def region_selection(self,
+                         score, 
+                         gt_mask,
+                         active_mask,
+                         active_regions,
+                         active,
+                         selected):
+        
+        for pixel in range(active_regions):
+            values, indices_h = torch.max(score, dim=0)
+            _, indices_w = torch.max(values, dim=0)
+            w = indices_w.item()
+            h = indices_h[w].item()
+
+            active_start_w = w - self.active_radius if w - self.active_radius >= 0 else 0
+            active_start_h = h - self.active_radius if h - self.active_radius >= 0 else 0
+            active_end_w = w + self.active_radius + 1
+            active_end_h = h + self.active_radius + 1
+
+            mask_start_w = w - self.mask_radius if w - self.mask_radius >= 0 else 0
+            mask_start_h = h - self.mask_radius if h - self.mask_radius >= 0 else 0
+            mask_end_w = w + self.mask_radius + 1
+            mask_end_h = h + self.mask_radius + 1
+
+            # mask out
+            score[mask_start_h:mask_end_h, mask_start_w:mask_end_w] = -float('inf')
+            active[mask_start_h:mask_end_h, mask_start_w:mask_end_w] = True
+            selected[active_start_h:active_end_h, active_start_w:active_end_w] = True
+            # active sampling
+            active_mask[active_start_h:active_end_h, active_start_w:active_end_w] = \
+                gt_mask[active_start_h:active_end_h, active_start_w:active_end_w]
+
+        return score, active_mask, active, selected
+
     def after_region_label(self, runner):
         model = runner.model
         model.eval()
-        device = next(model.parameters()).device
+        # device = next(model.parameters()).device
         target_loader = getattr(runner.train_loop, 'dataloader_active', None)
         # custom_pipeline = runner.test_loop.dataloader.dataset.pipeline
         dataset = target_loader.dataset
@@ -134,10 +170,10 @@ class RegionLabelHook(Hook):
         new_indicator_dir = os.path.join(os.path.dirname(orig_label_dir), 
                                         runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_indicator_path)
         state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
-        # if runner.train_loop.active_round == 0:
-        #     os.makedirs(new_label_dir, exist_ok=True)
-        #     os.makedirs(new_indicator_dir, exist_ok=True)
-        #     self.init_masks(target_loader, new_label_dir, new_indicator_dir)
+        if runner.train_loop.active_round == 0:
+            os.makedirs(new_label_dir, exist_ok=True)
+            os.makedirs(new_indicator_dir, exist_ok=True)
+            self.init_masks(target_loader, new_label_dir, new_indicator_dir)
 
         # Update active learning state
         runner.train_loop.active_round += 1
@@ -156,37 +192,77 @@ class RegionLabelHook(Hook):
         for data in tqdm(target_loader, total=file_count, desc="Generating active masks", unit='image(s)'):  # Limit for testing
         # for idx in tqdm(range(min(file_count, 100))):  # Limit for testing
             # TODO this wont work with a multibatch scenario
-            mask_path = data['data_samples'][0].seg_map_path
             gt_mask = data['data_samples'][0]._gt_sem_seg.data[0]
+            gt_mask_path = data['data_samples'][0].seg_map_path
+            active_mask = data['data_samples'][0]._active_mask.data[0]
+            active_mask_path = data['data_samples'][0].active_mask_path
+            active_selected = data['data_samples'][0]._active_selected.data[0]
+            active_indicator = data['data_samples'][0]._active_indicator.data[0]
+            active_indicator_path = data['data_samples'][0].active_indicator_path
 
             with torch.no_grad():
                 output = model.test_step(data)[0]
                 if hasattr(output, 'seg_logits'):
                     seg_logits = output.seg_logits.data
                 # pred = output.pred_sem_seg.data
-                scores = torch.softmax(seg_logits, dim=0).max(dim=0)[0]
-                uncertainty = 1 - scores
+                
+                # scores = torch.softmax(seg_logits, dim=0).max(dim=0)[0]
+                # uncertainty = 1 - scores
 
-            H, W = uncertainty.shape
+            H, W = 1024, 1024
             # TODO there is no caching of active_mask from previous runs. Should the mask from previous run be taken or 
             # should it be recalculated based on current uncertainties from the model.
-            active_mask = torch.full((H, W), 255, dtype=torch.uint8)
-            active = torch.zeros((H, W), dtype=torch.bool, device=device)
-            selected = torch.zeros((H, W), dtype=torch.bool, device=device)
 
             if self.selection_mode == 'ratio':
                 per_region_pixels = self.region_size ** 2
                 total_pixels = H * W
                 active_regions = int(region_ratio * total_pixels // per_region_pixels)
-                active_mask = self.get_all_active_regions_mask(
-                    uncertainty, gt_mask, active_mask, active_regions, active, selected)
+                active_mask, active, active_selected = self.get_all_active_regions_mask(
+                    uncertainty, 
+                    gt_mask, 
+                    active_mask, 
+                    active_regions, 
+                    active, 
+                    active_selected)
+            elif self.selection_mode == 'region_selection':
+                score, purity, entropy = self.region_scorer(seg_logits)
+                score[active_indicator] = -float('inf')
+                active_regions = math.ceil(H*W * self.active_ratio / self.per_region_pixels)
+                score, active_mask, active_indicator, active_selected = self.region_selection(
+                    score, 
+                    gt_mask, 
+                    active_mask, 
+                    active_regions,
+                    active_indicator, 
+                    active_selected)
+            elif self.selection_mode == 'pixel_selection':
+                score, purity, entropy = self.region_scorer(seg_logits)
+                score[active] = -float('inf')
+                active_regions = math.ceil(H*W * self.active_ratio / self.per_region_pixels)
+                active_mask, active, active_selected = self.region_selection(
+                    score, 
+                    gt_mask, 
+                    active_mask, 
+                    active_regions, 
+                    active, 
+                    active_selected)
             else:
-                active_mask = self.get_regions_above_threshold(
-                    uncertainty, gt_mask, active_mask, self.uncertainty_threshold, active, selected)
+                active_mask, active, active_selected = self.get_regions_above_threshold(
+                    uncertainty, 
+                    gt_mask, 
+                    active_mask, 
+                    self.uncertainty_threshold, 
+                    active, 
+                    active_selected)
 
             # Save the new mask
-            img_name = os.path.basename(mask_path)
-            save_path = os.path.join(new_label_dir, img_name)
-            Image.fromarray(active_mask.numpy()).save(save_path)
-            
+            # img_name = os.path.basename(active_mask_path)
+            # save_path = os.path.join(new_label_dir, img_name)
+            Image.fromarray(active_mask.numpy()).save(active_mask_path)
+            indicator = {
+                'active': active_indicator,
+                'selected': active_selected,
+            }
+            torch.save(indicator, active_indicator_path)
+
         print_log(f"Finished processing {processed_count} files, saved to {new_label_dir}", logger='current')
