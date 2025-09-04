@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from mmengine.hooks import Hook
 from mmengine.registry import HOOKS
 from mmengine.logging import print_log
+from glob import glob
 from .active_learning import FloatingRegionScore
 
 @HOOKS.register_module()
@@ -170,10 +171,20 @@ class RegionLabelHook(Hook):
         new_indicator_dir = os.path.join(os.path.dirname(orig_label_dir), 
                                         runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_indicator_path)
         state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
-        if runner.train_loop.active_round == 0:
+        # Check if active_state.txt exists and read the first line
+        skip_init_masks = False
+        if os.path.exists(state_path):
+            with open(state_path, 'r') as f:
+                first_line = f.readline().strip()
+                masks_list = glob(os.path.join(new_label_dir, '*.png'))
+                if first_line == '1' and len(masks_list) == len(target_loader):
+                    skip_init_masks = True
+        if runner.train_loop.active_round == 0 and not skip_init_masks:
             os.makedirs(new_label_dir, exist_ok=True)
             os.makedirs(new_indicator_dir, exist_ok=True)
             self.init_masks(target_loader, new_label_dir, new_indicator_dir)
+        else:
+            print_log(f"Masks have already been initiated from previous run with zeros. Skipping!")
 
         # Update active learning state
         runner.train_loop.active_round += 1
