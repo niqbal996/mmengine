@@ -2,12 +2,10 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from PIL import Image
 from tqdm import tqdm
 import math
-from torch.utils.data import DataLoader
 from mmengine.hooks import Hook
 from mmengine.registry import HOOKS
 from mmengine.logging import print_log
@@ -157,19 +155,22 @@ class RegionLabelHook(Hook):
     def after_region_label(self, runner):
         model = runner.model
         model.eval()
-        # device = next(model.parameters()).device
         target_loader = getattr(runner.train_loop, 'dataloader_active', None)
-        # custom_pipeline = runner.test_loop.dataloader.dataset.pipeline
         dataset = target_loader.dataset
         if target_loader is None:
             raise AttributeError("train_loop does not have a 'target_dataloader_iterator'.")
         # Find the original label directory and create the new one
         orig_label_dir = dataset.data_prefix['seg_map_path']
         budget_int = int(runner.train_loop.label_budget * 100) if runner.train_loop.label_budget < 1.0 else int(runner.train_loop.label_budget)
+        transforms = runner._train_loop.dataloader_active.dataset.pipeline.transforms
+        idx = next(
+            (i for i, t in enumerate(transforms) if t.__class__.__name__ == "LoadActiveMask"),
+            None
+        )
         new_label_dir = os.path.join(os.path.dirname(orig_label_dir), 
-                                         runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_mask_path)
+                                         runner._train_loop.dataloader_active.dataset.pipeline.transforms[idx].active_mask_path)
         new_indicator_dir = os.path.join(os.path.dirname(orig_label_dir), 
-                                        runner._train_loop.dataloader_active.dataset.pipeline.transforms[2].active_indicator_path)
+                                        runner._train_loop.dataloader_active.dataset.pipeline.transforms[idx].active_indicator_path)
         state_path = os.path.join(os.path.dirname(new_label_dir), 'active_state.txt')
         # Check if active_state.txt exists and read the first line
         skip_init_masks = False
