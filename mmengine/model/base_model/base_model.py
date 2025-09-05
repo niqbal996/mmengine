@@ -150,7 +150,7 @@ class BaseModel(BaseModule):
             source_data = self.data_preprocessor(data[0], True)
             source_supervised_loss = self._run_forward(source_data, mode='loss')
             losses.update({f'source_{k}': v for k, v in source_supervised_loss.items()})
-            if torch.sum((data[1]['data_samples'][0]._gt_sem_seg.data != 255)) != 0:
+            if torch.sum((data[1]['data_samples'][0]._active_mask.data != 255)) != 0:
                 target_data = self.data_preprocessor(data[1], True)
                 target_active_loss = self._run_forward(target_data, mode='loss')
                 losses.update({f'target_{k}': v for k, v in target_active_loss.items()})

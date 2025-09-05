@@ -277,4 +277,4 @@ class RegionLabelHook(Hook):
             }
             torch.save(indicator, active_indicator_path)
 
-        print_log(f"Finished processing {processed_count} files, saved to {new_label_dir}", logger='current')
+        # print_log(f"Finished processing {file_count} files, saved to {new_label_dir}", logger='current')
